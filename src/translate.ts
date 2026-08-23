@@ -16,10 +16,10 @@ const PROMPT_FILE =
 export const BASE_SYSTEM = readFileSync(PROMPT_FILE, "utf8").trim();
 if (!BASE_SYSTEM) throw new Error(`base system prompt is empty: ${PROMPT_FILE}`);
 
-export const DEFAULT_MODEL = process.env.DEFAULT_MODEL ?? "anthropic.claude-opus-5";
-export const DEFAULT_OPENAI_MODEL = process.env.DEFAULT_OPENAI_MODEL ?? "openai.gpt-oss-120b";
+export const DEFAULT_MODEL = process.env.DEFAULT_MODEL ?? "anthropic.claude-opus-4-7";
+export const DEFAULT_OPENAI_MODEL = process.env.DEFAULT_OPENAI_MODEL ?? "openai.gpt-oss-120b-1:0";
 
-/** Params shape shared by messages.create() and messages.stream(). */
+/** Internal request shape: Anthropic Messages params without `stream`. */
 export type Params = Omit<Anthropic.MessageCreateParamsNonStreaming, "stream">;
 
 /**
@@ -60,18 +60,18 @@ export function mergeSystem(
 const warned = new Set<string>();
 
 /**
- * Mantle namespaces every model as `provider.model` — openai.gpt-oss-120b,
- * anthropic.claude-opus-5, qwen.qwen3-235b, google.gemma-4-31b. The prefix before
- * the first dot is a bare provider name, which is what separates a real Mantle id
- * from a foreign one: "gpt-4.1" has a dot but its prefix ("gpt-4") has a dash, so
- * it is an OpenAI-native id, not a Mantle id.
+ * Bedrock namespaces every model as `provider.model` — anthropic.claude-opus-4-7,
+ * amazon.nova-pro-v1:0, meta.llama3-3-70b-instruct-v1:0. The prefix before the first dot
+ * is a bare provider name, which is what separates a real Bedrock id from a foreign one:
+ * "gpt-4.1" has a dot but its prefix ("gpt-4") has a dash, so it is an OpenAI-native id,
+ * not a Bedrock one.
  */
-const MANTLE_ID = /^[a-z][a-z0-9]*\.\S+$/;
+const BEDROCK_ID = /^[a-z][a-z0-9]*\.\S+$/;
 
-/** Which upstream surface a model has to go to. */
+/** Only used to keep a fallback inside the family the client asked for. */
 export type Family = "anthropic" | "openai";
 
-/** Foreign ids that plainly name an OpenAI-family model rather than a Mantle one. */
+/** Foreign ids that plainly name an OpenAI-family model rather than a Bedrock one. */
 const LOOKS_OPENAI = /^(gpt|chatgpt|codex|davinci|o[1-9])/i;
 
 /**
@@ -83,15 +83,12 @@ const LOOKS_OPENAI = /^(gpt|chatgpt|codex|davinci|o[1-9])/i;
  * lands on DEFAULT_OPENAI_MODEL, not on Claude. Swapping families changes tokenizer,
  * tool semantics and price all at once, which is not a substitution anyone wants made
  * on their behalf.
- *
- * The family also decides the upstream path: Mantle serves the Messages API for
- * Anthropic-family models only, and Chat Completions for everything else.
  */
 export function resolveModel(model?: string): { model: string; family: Family } {
   const tag = (m: string) => ({ model: m, family: familyOf(m) });
   if (!model) return tag(DEFAULT_MODEL);
   if (model.startsWith("claude")) return tag(`anthropic.${model}`); // any Claude id, dated or not
-  if (MANTLE_ID.test(model)) return tag(model); // incl. us./eu./apac. inference profiles
+  if (BEDROCK_ID.test(model)) return tag(model); // incl. us./eu./apac. inference profiles
 
   const fallback = LOOKS_OPENAI.test(model) ? DEFAULT_OPENAI_MODEL : DEFAULT_MODEL;
   if (!warned.has(model)) {
@@ -99,7 +96,7 @@ export function resolveModel(model?: string): { model: string; family: Family } 
     // grow on a stream of junk ids
     if (warned.size > 100) warned.clear();
     warned.add(model);
-    console.warn(`model "${model}" is not a Bedrock Mantle id — using ${fallback} instead`);
+    console.warn(`model "${model}" is not a Bedrock model id — using ${fallback} instead`);
   }
   return tag(fallback);
 }
@@ -127,7 +124,7 @@ export function modelList(models: { id: string; created?: number; owned_by?: str
     created: m.created ?? 0,
     created_at: new Date((m.created ?? 0) * 1000).toISOString(),
     display_name: m.id,
-    owned_by: m.owned_by ?? "bedrock-mantle",
+    owned_by: m.owned_by ?? "bedrock",
   }));
   return {
     object: "list",
@@ -151,7 +148,7 @@ export function countBreakpoints(value: unknown): number {
   return 0;
 }
 
-/** Applied to every Messages-API call, whichever dialect it arrived in. */
+/** Applied to every call, whichever dialect it arrived in. */
 export function normalize(p: Params, streaming = false): Params {
   const { model } = resolveModel(p.model);
   const out: Params = {

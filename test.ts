@@ -3,11 +3,12 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { makeKeyGuard, makeRateLimiter, presentedKey } from "./src/auth.ts";
 import { redact } from "./src/log.ts";
 import {
-  chatToMessage,
-  makeMessageEmitter,
-  messagesToChat,
-  sseJSON,
-} from "./src/anthropic-to-openai.ts";
+  converseToMessage,
+  makeConverseEmitter,
+  messagesToConverse,
+} from "./src/converse.ts";
+import { buildCatalogue } from "./src/catalogue.ts";
+import { eventStreamFrames } from "./src/eventstream.ts";
 import {
   BASE_SYSTEM,
   countBreakpoints,
@@ -42,27 +43,26 @@ import {
     return `${family}:${model}`;
   };
 
-  // anthropic family → Messages API
+  // a bare Claude id gets the anthropic. prefix
   assert.equal(r("claude-sonnet-5"), "anthropic:anthropic.claude-sonnet-5");
   assert.equal(r("claude-opus-4-5-20251101"), "anthropic:anthropic.claude-opus-4-5-20251101");
   assert.equal(r("anthropic.claude-opus-5"), "anthropic:anthropic.claude-opus-5");
   assert.equal(r("us.anthropic.claude-opus-5"), "anthropic:us.anthropic.claude-opus-5");
 
-  // every other Mantle model → OpenAI chat completions, id untouched
-  assert.equal(r("openai.gpt-oss-120b"), "openai:openai.gpt-oss-120b");
-  assert.equal(r("openai.gpt-5.5"), "openai:openai.gpt-5.5");
-  assert.equal(r("qwen.qwen3-235b"), "openai:qwen.qwen3-235b");
-  assert.equal(r("google.gemma-4-31b"), "openai:google.gemma-4-31b");
-  assert.equal(r("moonshotai.kimi-k2.5"), "openai:moonshotai.kimi-k2.5");
+  // any provider.model id passes through untouched
+  assert.equal(r("amazon.nova-pro-v1:0"), "openai:amazon.nova-pro-v1:0");
+  assert.equal(r("meta.llama3-3-70b-instruct-v1:0"), "openai:meta.llama3-3-70b-instruct-v1:0");
+  assert.equal(r("openai.gpt-oss-120b-1:0"), "openai:openai.gpt-oss-120b-1:0");
+  assert.equal(r("anthropic.claude-opus-4-6-v1"), "anthropic:anthropic.claude-opus-4-6-v1");
 
   // foreign ids are not Mantle ids, even the dotted ones → fallback, and the fallback
   // stays inside the family the client asked for
-  assert.equal(r("gpt-4o"), "openai:openai.gpt-oss-120b");
-  assert.equal(r("gpt-4.1"), "openai:openai.gpt-oss-120b");
-  assert.equal(r("o3-mini"), "openai:openai.gpt-oss-120b");
-  assert.equal(r("codex-mini-latest"), "openai:openai.gpt-oss-120b");
-  assert.equal(r("gemini-2.5-pro"), "anthropic:anthropic.claude-opus-5"); // neither → generic
-  assert.equal(r(undefined), "anthropic:anthropic.claude-opus-5");
+  assert.equal(r("gpt-4o"), "openai:openai.gpt-oss-120b-1:0");
+  assert.equal(r("gpt-4.1"), "openai:openai.gpt-oss-120b-1:0");
+  assert.equal(r("o3-mini"), "openai:openai.gpt-oss-120b-1:0");
+  assert.equal(r("codex-mini-latest"), "openai:openai.gpt-oss-120b-1:0");
+  assert.equal(r("gemini-2.5-pro"), "anthropic:anthropic.claude-opus-4-7"); // neither → generic
+  assert.equal(r(undefined), "anthropic:anthropic.claude-opus-4-7");
 }
 
 // base prompt goes in front of the client's messages on the OpenAI surface too
@@ -146,7 +146,7 @@ import {
     messages: [],
     temperature: 0.7,
   } as unknown as Params);
-  assert.equal(oss.model, "openai.gpt-oss-120b");
+  assert.equal(oss.model, "openai.gpt-oss-120b-1:0");
   assert.equal(oss.temperature, 0.7);
   assert.equal((p.system as Anthropic.TextBlockParam[])[0]!.text, BASE_SYSTEM);
 
@@ -316,179 +316,241 @@ import {
   assert.equal(redact("plain message"), "plain message");
 }
 
-// ─── bridge: Anthropic dialect → OpenAI upstream ──────────────────────────────
 
-// request translation, including the tool_result → role:tool split
+// ─── Converse translation ──────────────────────────────────────────────────────
+
+// request: system blocks, tool_result split, cachePoint gating, thinking passthrough
 {
-  const chat = messagesToChat(
-    {
-      model: "openai.gpt-oss-120b",
-      max_tokens: 512,
-      system: [
-        { type: "text", text: "BASE" },
-        { type: "text", text: "CLIENT" },
-      ],
-      stop_sequences: ["END"],
-      output_config: { effort: "xhigh" },
-      tool_choice: { type: "any" },
-      tools: [{ name: "w", description: "weather", input_schema: { type: "object" } }],
-      messages: [
-        { role: "user", content: "weather?" },
-        {
-          role: "assistant",
-          content: [
-            { type: "thinking", thinking: "hmm", signature: "sig" },
-            { type: "text", text: "checking" },
-            { type: "tool_use", id: "tu_1", name: "w", input: { city: "paris" } },
-          ],
-        },
-        {
-          role: "user",
-          content: [
-            { type: "tool_result", tool_use_id: "tu_1", content: "18C" },
-            { type: "text", text: "and london?" },
-          ],
-        },
-      ],
-    } as never,
-    "openai.gpt-oss-120b",
-  );
+  const p = {
+    model: "anthropic.claude-opus-4-7",
+    max_tokens: 512,
+    system: [
+      { type: "text", text: "BASE", cache_control: { type: "ephemeral" } },
+      { type: "text", text: "CLIENT" },
+    ],
+    thinking: { type: "adaptive" },
+    stop_sequences: ["END"],
+    tool_choice: { type: "any" },
+    tools: [{ name: "w", description: "weather", input_schema: { type: "object" } }],
+    messages: [
+      { role: "user", content: "weather?" },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "hmm", signature: "sig" },
+          { type: "text", text: "checking" },
+          { type: "tool_use", id: "tu_1", name: "w", input: { city: "paris" } },
+        ],
+      },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_1", content: "18C" }] },
+      { role: "system", content: "operator rule" },
+    ],
+  } as never;
 
-  assert.equal(chat.model, "openai.gpt-oss-120b");
-  assert.equal(chat.max_tokens, 512);
-  assert.deepEqual(chat.stop, ["END"]);
-  assert.equal(chat.reasoning_effort, "high"); // xhigh has no OpenAI equivalent
-  assert.equal(chat.tool_choice, "required");
-  assert.deepEqual(chat.tools?.[0]!.function.parameters, { type: "object" });
+  const withCaching = messagesToConverse(p, true);
+  assert.deepEqual(withCaching.system, [
+    { text: "BASE" },
+    { cachePoint: { type: "default" } }, // cache_control became a cachePoint
+    { text: "CLIENT" },
+    { text: "operator rule" }, // a mid-conversation system message joins system, not user
+  ]);
+  assert.deepEqual(withCaching.additionalModelRequestFields, { thinking: { type: "adaptive" } });
+  assert.deepEqual(withCaching.inferenceConfig, { maxTokens: 512, stopSequences: ["END"] });
+  assert.deepEqual(withCaching.toolConfig?.toolChoice, { any: {} });
+  assert.equal(withCaching.toolConfig?.tools[0]!.toolSpec.name, "w");
 
-  assert.deepEqual(
-    chat.messages.map((m) => m.role),
-    ["system", "user", "assistant", "tool", "user"],
-  );
-  assert.equal(chat.messages[0]!.content, "BASE\n\nCLIENT"); // base first, client appended
-  const assistant = chat.messages[2]!;
-  assert.equal(assistant.content, "checking"); // thinking block dropped
-  assert.equal(assistant.tool_calls?.[0]!.function.arguments, '{"city":"paris"}');
-  assert.equal(chat.messages[3]!.tool_call_id, "tu_1");
+  // Llama and gpt-oss reject cachePoint outright, so it must vanish when unsupported
+  const noCaching = messagesToConverse(p, false);
+  assert.deepEqual(noCaching.system, [
+    { text: "BASE" },
+    { text: "CLIENT" },
+    { text: "operator rule" },
+  ]);
 
-  // streaming is an explicit argument — inferring it from p.stream silently sent a
-  // non-streaming request upstream while the client waited on SSE
-  assert.equal(chat.stream, undefined);
-  const streamed = messagesToChat({ model: "m", max_tokens: 1, messages: [] } as never, "m", true);
-  assert.equal(streamed.stream, true);
-  assert.deepEqual(streamed.stream_options, { include_usage: true });
+  // roles: system messages are hoisted out, so only user/assistant remain
+  assert.deepEqual(withCaching.messages.map((m) => m.role), ["user", "assistant", "user"]);
+  const assistant = withCaching.messages[1]!.content;
+  assert.deepEqual(assistant.map((b) => Object.keys(b)[0]), ["text", "toolUse"]); // thinking dropped
+  assert.deepEqual(withCaching.messages[2]!.content, [
+    { toolResult: { toolUseId: "tu_1", content: [{ text: "18C" }] } },
+  ]);
 }
 
-// response translation
+// response
 {
-  const msg = chatToMessage(
+  const msg = converseToMessage(
     {
-      id: "cc_1",
-      choices: [
-        {
-          message: {
-            content: "here",
-            tool_calls: [{ id: "call_1", function: { name: "w", arguments: '{"city":"paris"}' } }],
-          },
-          finish_reason: "tool_calls",
+      output: {
+        message: {
+          content: [{ text: "here" }, { toolUse: { toolUseId: "t1", name: "w", input: { c: 1 } } }],
         },
-      ],
-      usage: { prompt_tokens: 9, completion_tokens: 3 },
+      },
+      stopReason: "tool_use",
+      usage: { inputTokens: 11, outputTokens: 3 },
     },
-    "openai.gpt-oss-120b",
+    "anthropic.claude-opus-4-7",
   );
-
-  assert.equal(msg.id, "msg_cc_1");
   assert.equal(msg.type, "message");
   assert.equal(msg.stop_reason, "tool_use");
   assert.deepEqual(msg.content.map((b) => b.type), ["text", "tool_use"]);
-  assert.deepEqual((msg.content[1] as Anthropic.ToolUseBlock).input, { city: "paris" });
-  assert.equal(msg.usage.input_tokens, 9);
+  assert.deepEqual((msg.content[1] as Anthropic.ToolUseBlock).input, { c: 1 });
+  assert.equal(msg.usage.input_tokens, 11);
 
-  // an empty completion still has to produce one block
-  const empty = chatToMessage({ choices: [{ message: { content: "" } }] }, "m");
-  assert.equal(empty.content.length, 1);
-  assert.equal(empty.stop_reason, "end_turn");
+  // an empty answer still has to produce one block
+  assert.equal(converseToMessage({ output: { message: { content: [] } } }, "m").content.length, 1);
 }
 
-// SSE: OpenAI chunks → a well-formed Anthropic event sequence
+// stream: Converse omits contentBlockStart for text, Anthropic clients require it
 {
-  const emitter = makeMessageEmitter("openai.gpt-oss-120b");
+  const e = makeConverseEmitter("anthropic.claude-opus-4-7");
   const events = [
-    ...emitter.push({ id: "cc_9", usage: { prompt_tokens: 11 }, choices: [{ delta: { content: "He" } }] }),
-    ...emitter.push({ choices: [{ delta: { content: "llo" } }] }),
-    ...emitter.push({
-      choices: [{ delta: { tool_calls: [{ index: 0, id: "call_1", function: { name: "w", arguments: "" } }] } }],
+    ...e.push("messageStart", { role: "assistant" }),
+    ...e.push("contentBlockDelta", { contentBlockIndex: 0, delta: { text: "Hi" } }),
+    ...e.push("contentBlockDelta", { contentBlockIndex: 0, delta: { text: "!" } }),
+    ...e.push("contentBlockStop", { contentBlockIndex: 0 }),
+    ...e.push("contentBlockStart", {
+      contentBlockIndex: 1,
+      start: { toolUse: { toolUseId: "t1", name: "w" } },
     }),
-    ...emitter.push({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '{"c":1}' } }] } }] }),
-    ...emitter.push({ choices: [{ delta: {}, finish_reason: "tool_calls" }], usage: { completion_tokens: 7 } }),
-    ...emitter.finish(),
+    ...e.push("contentBlockDelta", { contentBlockIndex: 1, delta: { toolUse: { input: '{"c":1}' } } }),
+    ...e.push("contentBlockStop", { contentBlockIndex: 1 }),
+    ...e.push("messageStop", { stopReason: "tool_use" }),
+    ...e.push("metadata", { usage: { inputTokens: 9, outputTokens: 4 } }),
+    ...e.finish(),
   ];
 
-  assert.deepEqual(
-    events.map((e) => e.type),
-    [
-      "message_start",
-      "content_block_start",
-      "content_block_delta",
-      "content_block_delta",
-      "content_block_stop", // text closes before the tool block opens
-      "content_block_start",
-      "content_block_delta",
-      "content_block_stop",
-      "message_delta",
-      "message_stop",
-    ],
-  );
+  assert.deepEqual(events.map((x) => x.type), [
+    "message_start",
+    "content_block_start", // synthesised on the first text delta
+    "content_block_delta",
+    "content_block_delta",
+    "content_block_stop",
+    "content_block_start",
+    "content_block_delta",
+    "content_block_stop",
+    "message_delta",
+    "message_stop",
+  ]);
 
-  // exactly one block open at a time, and indices are sequential from 0
+  // one block open at a time, every stop matching its start
   let open: number | null = null;
-  const opened: number[] = [];
-  for (const e of events) {
-    if (e.type === "content_block_start") {
-      assert.equal(open, null, "a block opened while another was still open");
-      open = e.index as number;
-      opened.push(open);
+  for (const x of events) {
+    if (x.type === "content_block_start") {
+      assert.equal(open, null, "a block opened while another was open");
+      open = x.index as number;
     }
-    if (e.type === "content_block_stop") {
-      assert.equal(open, e.index, "content_block_stop index does not match the open block");
+    if (x.type === "content_block_stop") {
+      assert.equal(open, x.index);
       open = null;
     }
   }
-  assert.equal(open, null, "stream ended with a block still open");
-  assert.deepEqual(opened, [0, 1]);
+  assert.equal(open, null);
 
-  const start = events[0] as unknown as { message: { id: string; usage: { input_tokens: number } } };
-  assert.equal(start.message.id, "msg_cc_9");
-  assert.equal(start.message.usage.input_tokens, 11);
-
-  const delta = events.at(-2) as unknown as { delta: { stop_reason: string }; usage: { output_tokens: number } };
+  const delta = events.at(-2) as unknown as {
+    delta: { stop_reason: string };
+    usage: { input_tokens: number; output_tokens: number };
+  };
   assert.equal(delta.delta.stop_reason, "tool_use");
-  assert.equal(delta.usage.output_tokens, 7);
+  assert.deepEqual(delta.usage, { input_tokens: 9, output_tokens: 4 });
 
-  const toolStart = events[5] as unknown as { content_block: { id: string; name: string } };
-  assert.equal(toolStart.content_block.id, "call_1");
-  assert.equal(toolStart.content_block.name, "w");
+  // an unterminated stream still gets closed properly
+  const e2 = makeConverseEmitter("m");
+  e2.push("messageStart", {});
+  e2.push("contentBlockDelta", { contentBlockIndex: 0, delta: { text: "partial" } });
+  assert.deepEqual(e2.finish().map((x) => x.type), [
+    "content_block_stop",
+    "message_delta",
+    "message_stop",
+  ]);
 }
 
-// SSE parser: partial lines across reads, [DONE], malformed chunks
+// catalogue: profile ARNs carry no slash before "foundation-model", which silently
+// dropped every INFERENCE_PROFILE model until it was fixed
 {
-  const wire = [
-    'data: {"id":"a"}\n\n',
-    'data: {"id":"b"',
-    '}\n\ndata: not-json\n\n',
-    'data: {"id":"c"}\n\ndata: [DONE]\n\ndata: {"id":"never"}\n\n',
-  ];
+  const cat = buildCatalogue(
+    {
+      modelSummaries: [
+        { modelId: "amazon.nova-lite-v1:0", inferenceTypesSupported: ["ON_DEMAND"], outputModalities: ["TEXT"] },
+        { modelId: "anthropic.claude-opus-4-6-v1", inferenceTypesSupported: ["INFERENCE_PROFILE"], outputModalities: ["TEXT"] },
+        { modelId: "meta.llama-x", inferenceTypesSupported: ["INFERENCE_PROFILE"], outputModalities: ["TEXT"] },
+        { modelId: "amazon.titan-embed", inferenceTypesSupported: ["ON_DEMAND"], outputModalities: ["EMBEDDING"] },
+        { modelId: "some.provisioned-only", inferenceTypesSupported: ["PROVISIONED"], outputModalities: ["TEXT"] },
+      ],
+    },
+    {
+      inferenceProfileSummaries: [
+        {
+          inferenceProfileId: "us.anthropic.claude-opus-4-6-v1",
+          status: "ACTIVE",
+          models: [{ modelArn: "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-opus-4-6-v1" }],
+        },
+        {
+          inferenceProfileId: "eu.meta.llama-x",
+          status: "INACTIVE", // ignored, so meta.llama-x is not callable
+          models: [{ modelArn: "arn:aws:bedrock:eu-west-1::foundation-model/meta.llama-x" }],
+        },
+      ],
+    },
+  );
+
+  assert.equal(cat.get("amazon.nova-lite-v1:0")?.upstreamId, "amazon.nova-lite-v1:0");
+  assert.equal(
+    cat.get("anthropic.claude-opus-4-6-v1")?.upstreamId,
+    "us.anthropic.claude-opus-4-6-v1",
+  );
+  assert.equal(cat.has("meta.llama-x"), false); // no ACTIVE profile
+  assert.equal(cat.has("amazon.titan-embed"), false); // not a text model
+  assert.equal(cat.has("some.provisioned-only"), false); // not callable on demand
+
+  // caching support is measured per model, not assumed
+  assert.equal(cat.get("anthropic.claude-opus-4-6-v1")?.caching, true);
+  assert.equal(cat.get("amazon.nova-lite-v1:0")?.caching, true);
+}
+
+// event-stream frame parser
+{
+  const frame = (event: string, payload: unknown) => {
+    const body = Buffer.from(JSON.stringify(payload));
+    const name = Buffer.from(":event-type");
+    // [1B name len][name][1B type=7][2B value len][value]
+    const header = Buffer.concat([
+      Buffer.from([name.length]),
+      name,
+      Buffer.from([7]),
+      (() => { const b = Buffer.alloc(2); b.writeUInt16BE(event.length); return b; })(),
+      Buffer.from(event),
+    ]);
+    const total = 12 + header.length + body.length + 4;
+    const out = Buffer.alloc(total);
+    out.writeUInt32BE(total, 0);
+    out.writeUInt32BE(header.length, 4);
+    header.copy(out, 12);
+    body.copy(out, 12 + header.length);
+    return out;
+  };
+
+  const wire = Buffer.concat([
+    frame("messageStart", { role: "assistant" }),
+    frame("contentBlockDelta", { contentBlockIndex: 0, delta: { text: "hi" } }),
+    frame("messageStop", { stopReason: "end_turn" }),
+  ]);
+
+  // split mid-frame to prove the reader buffers across chunks
+  const cuts = [7, 40, wire.length];
+  let from = 0;
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
-      for (const piece of wire) controller.enqueue(new TextEncoder().encode(piece));
+      for (const to of cuts) {
+        controller.enqueue(new Uint8Array(wire.subarray(from, to)));
+        from = to;
+      }
       controller.close();
     },
   });
 
   const seen: string[] = [];
-  for await (const chunk of sseJSON(body)) seen.push((chunk as { id: string }).id);
-  assert.deepEqual(seen, ["a", "b", "c"]); // split chunk rejoined, junk skipped, DONE stops it
+  for await (const f of eventStreamFrames(body)) seen.push(f.event);
+  assert.deepEqual(seen, ["messageStart", "contentBlockDelta", "messageStop"]);
 }
 
 console.log("ok");
