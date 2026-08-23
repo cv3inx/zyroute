@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import type Anthropic from "@anthropic-ai/sdk";
-import { makeKeyGuard, makeRateLimiter, presentedKey } from "./src/auth.js";
-import { redact } from "./src/log.js";
+import { makeKeyGuard, makeRateLimiter, presentedKey } from "./src/auth.ts";
+import { redact } from "./src/log.ts";
 import {
   chatToMessage,
   makeMessageEmitter,
   messagesToChat,
   sseJSON,
-} from "./src/anthropic-to-openai.js";
+} from "./src/anthropic-to-openai.ts";
 import {
   BASE_SYSTEM,
   countBreakpoints,
@@ -21,7 +21,7 @@ import {
   toChatCompletion,
   withBaseSystem,
   type Params,
-} from "./src/translate.js";
+} from "./src/translate.ts";
 
 // system prompt is appended, never replaced
 {

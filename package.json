@@ -4,9 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx watch --env-file-if-exists=.env src/index.ts",
-    "start": "tsx --env-file-if-exists=.env src/index.ts",
-    "test": "tsx test.ts",
+    "dev": "node --watch --env-file-if-exists=.env src/index.ts",
+    "start": "node --env-file-if-exists=.env src/index.ts",
+    "test": "node test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -17,7 +17,9 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
-    "tsx": "^4.23.12",
     "typescript": "^5.9.0"
+  },
+  "engines": {
+    "node": ">=23.6"
   }
 }

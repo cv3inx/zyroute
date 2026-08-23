@@ -69,17 +69,17 @@ import {
   withBaseSystem,
   type OpenAIRequest,
   type Params,
-} from "./translate.js";
+} from "./translate.ts";
 import {
   chatToMessage,
   makeMessageEmitter,
   messagesToChat,
   sseJSON,
   type ChatResponse,
-} from "./anthropic-to-openai.js";
+} from "./anthropic-to-openai.ts";
 import { bodyLimit } from "hono/body-limit";
-import { makeKeyGuard, makeRateLimiter, presentedKey } from "./auth.js";
-import { bold, cyan, dim, logBody, ms, redact, statusColor } from "./log.js";
+import { makeKeyGuard, makeRateLimiter, presentedKey } from "./auth.ts";
+import { bold, cyan, dim, logBody, ms, redact, statusColor } from "./log.ts";
 
 /** Accepts the host with or without a /anthropic suffix. */
 function mantleHost(): string {
@@ -189,13 +189,19 @@ app.get("/v1/models/:id", async (c) => {
 /** Missing configuration, as opposed to an upstream failure. */
 class ConfigError extends Error {}
 
-/** A non-2xx from Mantle, carried out to onError with its status intact. */
+/**
+ * A non-2xx from Mantle, carried out to onError with its status intact.
+ *
+ * Written without a constructor parameter property on purpose: Node runs this file's
+ * TypeScript directly in strip-only mode, and parameter properties need a real
+ * transform. Keeping them out is what lets the Docker image skip tsx and any build step.
+ */
 class UpstreamError extends Error {
-  constructor(
-    readonly status: number,
-    message: string,
-  ) {
+  status: number;
+
+  constructor(status: number, message: string) {
     super(message);
+    this.status = status;
   }
 }
 

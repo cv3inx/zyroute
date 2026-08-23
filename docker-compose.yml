@@ -1,0 +1,21 @@
+services:
+  zyroute:
+    build: .
+    # Every setting — keys, region, models, PORT — comes from .env.
+    env_file: .env
+    ports:
+      - "${PORT:-8787}:${PORT:-8787}"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:${PORT:-8787}/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    # Edit the prompt without rebuilding; restart the container to reload it.
+    volumes:
+      - ./system-prompt.md:/app/system-prompt.md:ro

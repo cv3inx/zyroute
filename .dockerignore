@@ -1,0 +1,9 @@
+node_modules
+.env
+.git
+.claude
+test.ts
+tsconfig.json
+README.md
+Dockerfile
+docker-compose.yml

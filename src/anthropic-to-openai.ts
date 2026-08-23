@@ -6,7 +6,7 @@
  * request, and OpenAI -> Anthropic for the response and the SSE stream.
  */
 import type Anthropic from "@anthropic-ai/sdk";
-import { parseArgs, type OpenAIMessage } from "./translate.js";
+import { parseArgs, type OpenAIMessage } from "./translate.ts";
 
 type Part = { type: string; text?: string; image_url?: { url: string } };
 
